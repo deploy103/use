@@ -3,6 +3,7 @@ import { ShieldCheck, Info } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, message } from "@/lib/api";
+import { McpSettings } from "@/components/mcp-settings";
 
 export function Settings({
   dark,
@@ -58,7 +59,7 @@ export function Settings({
         </div>
         <div className="panel-body space-y-5">
           <p className="text-xs muted">
-            Use 소유자 관리 비밀번호입니다. Claude·Gemini·ChatGPT의 비밀번호와는
+            AI 대시보드 소유자 관리 비밀번호입니다. Claude·Gemini·ChatGPT의 비밀번호와는
             별개입니다. 변경하면 이전 세션을 폐기하고 현재 브라우저에 새 세션
             쿠키를 발급합니다.
           </p>
@@ -158,6 +159,7 @@ export function Settings({
           </div>
         </div>
       </div>
+      <McpSettings />
     </div>
   );
 }

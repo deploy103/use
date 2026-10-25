@@ -105,7 +105,7 @@
   align-items: center;
   gap: 11px;
   padding: 0 10px;
-  font-size: 25px;
+  font-size: 20px;
   font-weight: 650;
   letter-spacing: -0.8px;
 }
@@ -114,10 +114,11 @@
   place-items: center;
   width: 35px;
   height: 35px;
+  flex-shrink: 0;
   border-radius: 10px;
   background: var(--primary);
   color: var(--primary-foreground);
-  font-size: 30px;
+  font-size: 18px;
   line-height: 1;
   font-weight: 700;
 }

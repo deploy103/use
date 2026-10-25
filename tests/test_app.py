@@ -11,6 +11,7 @@ import sqlite3
 import httpx
 import pytest
 import pytest_asyncio
+from asgi_lifespan import LifespanManager
 
 from collectors import CollectionError
 
@@ -81,7 +82,7 @@ async def api(tmp_path, monkeypatch, app_module):
     monkeypatch.delenv("ATLAS_PUBLIC_ORIGIN", raising=False)
     fake = FakeCollector()
     application = app_module.create_app(tmp_path, collector=fake, poll_seconds=0)
-    async with application.router.lifespan_context(application):
+    async with LifespanManager(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url=ORIGIN,
             headers={"Origin": ORIGIN},
@@ -649,7 +650,7 @@ async def chatgpt_api(tmp_path, monkeypatch, app_module):
     fake = FakeCollector()
     application = app_module.create_app(tmp_path, collector=fake, poll_seconds=0)
     manager, = managers
-    async with application.router.lifespan_context(application):
+    async with LifespanManager(application):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=application), base_url=ORIGIN,
             headers={"Origin": ORIGIN},
@@ -1261,3 +1262,171 @@ async def test_password_change_checks_current_and_revokes_other_sessions(owner):
     assert (await client.get("/api/dashboard")).status_code == 200
     assert (await client.post("/api/login", json={"password": PASSWORD})).status_code == 401
     assert (await client.post("/api/login", json={"password": new_password})).status_code == 200
+
+
+async def mcp_rpc(client, token, method, params=None):
+    request = client.build_request("POST", "/mcp", headers={
+        "Host": "localhost", "Authorization": "Bearer " + token,
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-11-25",
+    }, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}})
+    del request.headers["Origin"]
+    request.headers.pop("Cookie", None)
+    return await client.send(request)
+
+
+@pytest.mark.asyncio
+async def test_mcp_keys_are_owner_only_one_time_hashed_revocable_and_persistent(api, app_module):
+    client, fake, root = api
+    for method, path in [("GET", "/api/mcp/keys"), ("POST", "/api/mcp/keys"),
+                         ("DELETE", "/api/mcp/keys/missing")]:
+        assert (await client.request(method, path, json={"name": "test"})).status_code == 401
+    await client.post("/api/setup", json={
+        "token": (root / "setup.token").read_text().strip(), "password": PASSWORD,
+    })
+    created = await client.post("/api/mcp/keys", json={"name": "  My client  "})
+    assert created.status_code == 200
+    key = created.json()
+    assert key["name"] == "My client" and key["token"].startswith("aid_mcp_")
+    assert set(key) == {"id", "name", "created_at", "token"}
+    listed = await client.get("/api/mcp/keys")
+    assert listed.json() == {"keys": [{k: v for k, v in key.items() if k != "token"}]}
+    with sqlite3.connect(root / "atlas.sqlite") as conn:
+        saved = conn.execute("SELECT hash FROM mcp_keys").fetchone()[0]
+    assert key["token"] not in saved and len(saved) == 64
+    assert key["token"] not in listed.text and saved not in listed.text
+    response = await mcp_rpc(client, key["token"], "tools/list")
+    assert response.status_code == 200, response.text
+    restarted = app_module.create_app(root, collector=fake, poll_seconds=0)
+    async with (
+        LifespanManager(restarted),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted), base_url=ORIGIN) as second,
+    ):
+        # Existing key works after recreation without a browser session.
+        second.headers["Origin"] = ORIGIN
+        assert (await mcp_rpc(second, key["token"], "tools/list")).status_code == 200
+    assert (await client.delete(f"/api/mcp/keys/{key['id']}")).json() == {"deleted": True}
+    assert (await mcp_rpc(client, key["token"], "tools/list")).status_code == 401
+    assert (await client.delete(f"/api/mcp/keys/{key['id']}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_use_stored_filtered_data_and_never_expose_credentials(owner):
+    client, fake, _ = owner
+    fake.results["private-provider-key"] = {
+        **result(record("model-A", input_tokens=137, output_tokens=29, cache_read_tokens=11, cache_write_tokens=3)),
+        "quota": [{"label": "Window", "remaining": 37, "used_percent": 63, "limit": 100}],
+        "summary": {"period": "lifetime", "total_tokens": 910000},
+    }
+    account = await add_account(client, credential="private-provider-key", name="First")
+    fake.results["other-key"] = result(record("model-B", input_tokens=9000))
+    await add_account(client, credential="other-key", name="Second", provider="gemini")
+    key = (await client.post("/api/mcp/keys", json={"name": "Reader"})).json()["token"]
+    response = await mcp_rpc(client, key, "initialize", {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "synthetic-client", "version": "1"},
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["serverInfo"]["title"] == "AI 대시보드"
+    tools = (await mcp_rpc(client, key, "tools/list")).json()["result"]["tools"]
+    assert {tool["name"] for tool in tools} == {"usage_summary", "list_accounts", "account_quota"}
+    assert all(tool["annotations"]["readOnlyHint"] for tool in tools)
+    listed = (await mcp_rpc(client, key, "tools/call", {"name": "list_accounts"})).json()["result"]
+    assert not listed.get("isError"), listed
+    assert {a["name"] for a in listed["structuredContent"]["accounts"]} == {"First", "Second"}
+    assert "secret" not in str(listed) and "base_url" not in str(listed)
+    usage = (await mcp_rpc(client, key, "tools/call", {
+        "name": "usage_summary", "arguments": {"range": "all", "account": account["id"], "provider": "openai"},
+    })).json()["result"]["structuredContent"]
+    assert usage["totals"]["total_tokens"] == 180
+    assert len(usage["models"]) == 1 and usage["models"][0]["model"] == "model-A"
+    assert usage["timezone"] == "Asia/Seoul"
+    assert "accounts" not in usage and "providers" not in usage
+    quota = (await mcp_rpc(client, key, "tools/call", {
+        "name": "account_quota", "arguments": {"account_id": account["id"]},
+    })).json()["result"]["structuredContent"]
+    assert quota["quota"][0]["remaining"] == 37
+    assert quota["summary"]["total_tokens"] == 910000
+    assert "credential" not in str(quota) and "private-provider-key" not in str(quota)
+    for name, arguments in [("refresh", {}), ("account_quota", {"account_id": "' OR 1=1--"}),
+                            ("usage_summary", {"range": "invalid"})]:
+        failure = (await mcp_rpc(client, key, "tools/call", {"name": name, "arguments": arguments})).json()
+        assert failure.get("error") or failure["result"].get("isError")
+    # A successful MCP read must not perform another collection.
+    fake.failures["private-provider-key"] = CollectionError("Do not call")
+    assert (await mcp_rpc(client, key, "tools/call", {"name": "account_quota", "arguments": {"account_id": account["id"]}})).json()["result"]["structuredContent"] == quota
+
+
+@pytest.mark.asyncio
+async def test_mcp_bearer_does_not_grant_owner_access_or_bypass_origin_and_size_checks(owner):
+    client, _, _ = owner
+    key = (await client.post("/api/mcp/keys", json={"name": "Reader"})).json()["token"]
+    # Browser owner cookie alone never authenticates MCP.
+    response = await client.post("/mcp", json={})
+    assert response.status_code == 401 and "Bearer" in response.headers["www-authenticate"]
+    assert (await mcp_rpc(client, "invalid-key", "tools/list")).status_code == 401
+    headers = {"Host": "localhost", "Authorization": "Bearer " + key}
+    for method in ("POST", "GET", "DELETE"):
+        response = await client.request(method, "/mcp", headers={**headers, "Origin": "https://foreign.example"})
+        assert response.status_code == 403
+    response = await client.post("/mcp", headers={**headers, "Origin": "http://localhost"}, content="x" * 65537)
+    assert response.status_code == 413
+    await client.post("/api/logout", json={})
+    for method, path in [("GET", "/api/dashboard"), ("POST", "/api/refresh"),
+                         ("GET", "/api/mcp/keys"), ("POST", "/api/mcp/keys")]:
+        assert (await client.request(method, path, headers={"Authorization": "Bearer " + key}, json={"name": "no"})).status_code == 401
+    assert (await mcp_rpc(client, key, "tools/list")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_mcp_key_validation_and_count_bound(owner):
+    client, _, _ = owner
+    for data in ({}, {"name": ""}, {"name": " "}, {"name": "a" * 101},
+                 {"name": "bad\nname"}, {"name": "good", "token": "chosen"}):
+        assert (await client.post("/api/mcp/keys", json=data)).status_code == 400
+    keys = []
+    for i in range(20):
+        response = await client.post("/api/mcp/keys", json={"name": f"Client {i}"})
+        assert response.status_code == 200, response.text
+        keys.append(response.json())
+    assert len({key["token"] for key in keys}) == 20
+    assert (await client.post("/api/mcp/keys", json={"name": "One too many"})).status_code == 400
+    await client.delete(f"/api/mcp/keys/{keys[0]['id']}")
+    assert (await client.post("/api/mcp/keys", json={"name": "Replacement"})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_mcp_official_client_and_public_origin_transport(owner, app_module, monkeypatch):
+    import httpx2
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    client, fake, root = owner
+    key = (await client.post("/api/mcp/keys", json={"name": "SDK client"})).json()["token"]
+    origin = "https://use.example.com"
+    monkeypatch.setenv("ATLAS_PUBLIC_ORIGIN", origin)
+    application = app_module.create_app(root, collector=fake, poll_seconds=0)
+    async with (
+        LifespanManager(application),
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=application),
+            headers={"Authorization": "Bearer " + key},
+        ) as sdk_http,
+    ):
+        async with (
+            streamable_http_client(origin + "/mcp", http_client=sdk_http) as streams,
+            ClientSession(streams[0], streams[1]) as session,
+        ):
+            initialized = await session.initialize()
+            assert initialized.server_info.title == "AI 대시보드"
+            tools = await session.list_tools()
+            assert {tool.name for tool in tools.tools} == {"list_accounts", "usage_summary", "account_quota"}
+            accounts = await session.call_tool("list_accounts", {})
+            assert not accounts.is_error and accounts.structured_content == {"accounts": []}
+            empty = await session.call_tool("usage_summary", {"range": "all"})
+            assert not empty.is_error and empty.structured_content["totals"]["total_tokens"] is None
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        for extra, expected in [({"Origin": "https://foreign.example"}, 403),
+                                ({"Host": "wrong.example", "X-Forwarded-Host": "use.example.com"}, 400)]:
+            response = await sdk_http.post(origin + "/mcp", headers=extra, json=payload)
+            assert response.status_code == expected

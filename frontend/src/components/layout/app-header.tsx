@@ -82,9 +82,9 @@ export function AppHeader({
           }}
           className="brand"
         >
-          <span className="brand-mark">u</span>
+          <span className="brand-mark">AI</span>
           <span>
-            Use<span className="brand-caption">AI USAGE WORKSPACE</span>
+            AI 대시보드<span className="brand-caption">AI USAGE WORKSPACE</span>
           </span>
         </a>
         <p className="rail-label">WORKSPACE</p>
@@ -110,7 +110,7 @@ export function AppHeader({
                 <Menu />
               </Button>
               <span className="text-xs text-muted-foreground">
-                Workspace <span className="mx-2 opacity-40">/</span>
+                AI 대시보드 <span className="mx-2 opacity-40">/</span>
                 <span className="text-foreground">
                   {nav.find((n) => n.id === page)?.label}
                 </span>
@@ -147,13 +147,13 @@ export function AppHeader({
           {children}
         </main>
         <footer className="workspace-footer">
-          Use{" "}
+          AI 대시보드{" "}
           <span>Read-only upstream · 구독 한도와 사용 기록을 구분합니다</span>
         </footer>
       </div>
       <Dialog open={mobileOpen} onOpenChange={setMobileOpen}>
         <DialogContent>
-          <DialogTitle>Use workspace</DialogTitle>
+          <DialogTitle>AI 대시보드</DialogTitle>
           <DialogDescription>페이지 이동</DialogDescription>
           {links}
         </DialogContent>

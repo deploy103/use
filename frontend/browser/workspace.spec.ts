@@ -2,7 +2,12 @@ import { test, expect } from "@playwright/test";
 import type { Page, TestInfo } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { mockBackend, oauthFixture } from "./fixtures";
+import {
+  mcpKeyFixture,
+  mockBackend,
+  oauthFixture,
+  syntheticMcpToken,
+} from "./fixtures";
 
 async function capture(page: Page, info: TestInfo, state: string) {
   const dir = path.resolve("../.amp/in/artifacts/use-frontend");
@@ -158,6 +163,364 @@ test("custom API defaults, explicit test, mutation, unsupported is not zero", as
   expect(state.calls.filter((c) => c.path === "/api/accounts")).toHaveLength(2);
   const storage = await page.evaluate(() => ({ ...localStorage }));
   expect(storage).toEqual({ "use-theme": "dark" });
+  expect(state.unexpected).toEqual([]);
+});
+
+test("AI 대시보드 branding on login, header and mobile menu", async ({
+  page,
+}, info) => {
+  const state = await mockBackend(page);
+  state.authenticated = false;
+  await page.goto("/");
+  await expect(page).toHaveTitle("AI 대시보드");
+  await expect(page.locator(".auth-card .brand")).toContainText("AI 대시보드");
+  await expect(page.locator(".brand-mark")).toHaveText("AI");
+  await expect(
+    page.getByRole("heading", { name: "관리자 로그인" }),
+  ).toBeVisible();
+  await capture(page, info, "login-rebrand");
+  await page
+    .getByLabel("관리자 비밀번호", { exact: true })
+    .fill("synthetic-owner-password");
+  await page.getByRole("button", { name: "로그인", exact: true }).click();
+  await expect(page.locator("header")).toContainText("AI 대시보드");
+  await expect(page.locator("footer")).toContainText("AI 대시보드");
+  await expect(page.locator("body")).not.toContainText(/\bUse\b/);
+  await capture(page, info, "header-rebrand");
+  if (info.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "메뉴 열기" }).click();
+    await expect(page.getByRole("dialog")).toContainText("AI 대시보드");
+    await capture(page, info, "menu-rebrand");
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+  } else {
+    await expect(page.locator(".rail .brand")).toBeVisible();
+    await navigate(page, "Settings");
+  }
+  await expect(
+    page.getByText(/AI 대시보드 소유자 관리 비밀번호/),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  expect(state.unexpected).toEqual([]);
+});
+
+test("named MCP key creation, one-time secret, copyable placeholder configuration and revocation", async ({
+  page,
+}, info) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: async (value: string) => {
+          Object.assign(window, { syntheticClipboard: value });
+        },
+      },
+      configurable: true,
+    });
+  });
+  const state = await mockBackend(page);
+  const consoleMessages: string[] = [];
+  const errors: string[] = [];
+  page.on("console", (entry) => consoleMessages.push(entry.text()));
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/settings");
+  await expect(page.getByText("발급한 MCP 키가 없습니다.")).toBeVisible();
+  await expect(page.getByText(/모든 계정 이름·통계·한도/)).toBeVisible();
+  await expect(
+    page.getByText(/다중 사용자 격리 기능이 아닙니다/),
+  ).toBeVisible();
+  await expect(page.getByText(/Streamable HTTP/)).toBeVisible();
+  await expect(page.getByLabel("MCP 엔드포인트", { exact: true })).toHaveValue(
+    "http://127.0.0.1:4179/mcp",
+  );
+  await expect(
+    page.getByText(/usage_summary\(range, account, provider\)/),
+  ).toBeVisible();
+  await expect(page.getByText(/list_accounts\(\)/)).toBeVisible();
+  await expect(page.getByText(/account_quota\(account_id\)/)).toBeVisible();
+  await page.getByText("클라이언트 JSON 설정 예시", { exact: true }).click();
+  const config = page.getByLabel("MCP 클라이언트 설정");
+  const expectedConfig = {
+    mcpServers: {
+      "ai-dashboard": {
+        type: "http",
+        url: "http://127.0.0.1:4179/mcp",
+        headers: { Authorization: "Bearer <MCP key>" },
+      },
+    },
+  };
+  expect(JSON.parse((await config.textContent())!)).toEqual(expectedConfig);
+  await page.getByRole("button", { name: "JSON 설정 복사" }).click();
+  expect(
+    await page.evaluate(() => Reflect.get(window, "syntheticClipboard")),
+  ).toBe(JSON.stringify(expectedConfig, null, 2));
+  await page
+    .getByRole("button", { name: "엔드포인트 복사", exact: true })
+    .click();
+  expect(
+    await page.evaluate(() => Reflect.get(window, "syntheticClipboard")),
+  ).toBe("http://127.0.0.1:4179/mcp");
+  await capture(page, info, "mcp-settings");
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  const issue = page.getByRole("button", { name: "MCP 키 발급", exact: true });
+  await expect(issue).toBeDisabled();
+  await page.getByLabel("MCP 키 이름", { exact: true }).fill("   ");
+  await expect(issue).toBeDisabled();
+  await page
+    .getByLabel("MCP 키 이름", { exact: true })
+    .fill("  Trusted teammate  ");
+  await issue.click();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveValue(
+    syntheticMcpToken,
+  );
+  expect(
+    state.calls.find(
+      (call) => call.path === "/api/mcp/keys" && call.method === "POST",
+    )?.body,
+  ).toEqual({ name: "Trusted teammate" });
+  expect(Object.keys(state.mcpKeys[0]).sort()).toEqual([
+    "created_at",
+    "id",
+    "name",
+  ]);
+  await capture(page, info, "mcp-token-once");
+  await page.getByRole("button", { name: "MCP 키 복사", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("MCP 키 복사 완료");
+  expect(
+    await page.evaluate(() => Reflect.get(window, "syntheticClipboard")),
+  ).toBe(syntheticMcpToken);
+  expect(await page.evaluate(() => ({ ...localStorage }))).toEqual({
+    "use-theme": "dark",
+  });
+  expect(await page.evaluate(() => ({ ...sessionStorage }))).toEqual({});
+  await page.getByRole("button", { name: "저장했어요 · 닫기" }).click();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText(syntheticMcpToken);
+  await expect(config).not.toContainText(syntheticMcpToken);
+  await page.reload();
+  await expect(page.getByRole("list", { name: "발급한 MCP 키" })).toContainText(
+    "Trusted teammate",
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Trusted teammate MCP 키 삭제", exact: true })
+    .click();
+  await page.getByRole("button", { name: "취소", exact: true }).click();
+  expect(state.calls.filter((call) => call.method === "DELETE")).toHaveLength(
+    0,
+  );
+  await page
+    .getByRole("button", { name: "Trusted teammate MCP 키 삭제", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "MCP 키 삭제 확인", exact: true })
+    .click();
+  await expect(page.getByText("발급한 MCP 키가 없습니다.")).toBeVisible();
+  expect(state.calls.find((call) => call.method === "DELETE")?.path).toBe(
+    "/api/mcp/keys/synthetic-mcp-1",
+  );
+  expect(consoleMessages.join("\n")).not.toContain(syntheticMcpToken);
+  expect(errors).toEqual([]);
+  expect(state.unexpected).toEqual([]);
+});
+
+test("MCP list, create, clipboard and delete failures remain recoverable", async ({
+  page,
+}, info) => {
+  const state = await mockBackend(page);
+  state.mcpFailure = "GET";
+  await page.goto("/settings");
+  await expect(page.getByRole("alert")).toContainText(
+    "합성 MCP 서버 일시 오류",
+  );
+  await expect(
+    page.getByRole("button", { name: "MCP 키 발급", exact: true }),
+  ).toBeDisabled();
+  state.mcpFailure = null;
+  await page.getByRole("button", { name: "키 목록 다시 시도" }).click();
+  await expect(page.getByText("발급한 MCP 키가 없습니다.")).toBeVisible();
+  state.mcpFailure = "POST";
+  await page
+    .getByLabel("MCP 키 이름", { exact: true })
+    .fill("Recovery recipient");
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "합성 MCP 서버 일시 오류",
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByLabel("MCP 키 이름", { exact: true })).toHaveValue(
+    "Recovery recipient",
+  );
+  state.mcpFailure = null;
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveValue(
+    syntheticMcpToken,
+  );
+  await page.evaluate(() =>
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: async () => {
+          throw new Error("Synthetic clipboard permission denied");
+        },
+      },
+      configurable: true,
+    }),
+  );
+  await page.getByRole("button", { name: "MCP 키 복사", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "텍스트를 직접 선택해 복사하세요",
+  );
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveValue(
+    syntheticMcpToken,
+  );
+  // Escape is also a destructive dismissal: the original token cannot reopen.
+  await page.keyboard.press("Escape");
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveCount(0);
+  state.mcpFailure = "DELETE";
+  await page
+    .getByRole("button", {
+      name: "Recovery recipient MCP 키 삭제",
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("button", { name: "MCP 키 삭제 확인", exact: true })
+    .click();
+  await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
+    "합성 MCP 서버 일시 오류",
+  );
+  expect(state.mcpKeys).toHaveLength(1);
+  await capture(page, info, "mcp-delete-error");
+  state.mcpFailure = null;
+  await page
+    .getByRole("button", { name: "MCP 키 삭제 확인", exact: true })
+    .click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByText("발급한 MCP 키가 없습니다.")).toBeVisible();
+  expect(state.unexpected).toEqual([]);
+});
+
+test("MCP name length and twenty-key boundary", async ({ page }) => {
+  const state = await mockBackend(page);
+  state.mcpKeys = Array.from({ length: 19 }, (_, index) =>
+    mcpKeyFixture(index + 1),
+  );
+  state.mcpNextId = 20;
+  await page.goto("/settings");
+  await expect(
+    page.getByRole("heading", { name: "발급한 키 (19/20)" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("MCP 키 이름", { exact: true })).toHaveAttribute(
+    "maxlength",
+    "100",
+  );
+  const longName = "가".repeat(100);
+  await page.getByLabel("MCP 키 이름", { exact: true }).fill(longName);
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toBeVisible();
+  expect(state.mcpKeys.at(-1)?.name).toBe(longName);
+  await page.getByRole("button", { name: "저장했어요 · 닫기" }).click();
+  await expect(
+    page.getByRole("heading", { name: "발급한 키 (20/20)" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("MCP 키 이름", { exact: true })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "MCP 키 발급", exact: true }),
+  ).toBeDisabled();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page
+    .getByRole("button", { name: `${longName} MCP 키 삭제`, exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "MCP 키 삭제 확인", exact: true })
+    .click();
+  await expect(page.getByLabel("MCP 키 이름", { exact: true })).toBeEnabled();
+  // Another owner tab can consume the last slot. Surface the server rejection.
+  state.mcpKeys.push(mcpKeyFixture(21));
+  await page.getByLabel("MCP 키 이름", { exact: true }).fill("a");
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "MCP 키는 최대 20개입니다.",
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(state.unexpected).toEqual([]);
+});
+
+test("MCP secrets discarded on navigation, session expiry and late creation", async ({
+  page,
+}) => {
+  const state = await mockBackend(page);
+  await page.goto("/dashboard");
+  await navigate(page, "Settings");
+  await page
+    .getByLabel("MCP 키 이름", { exact: true })
+    .fill("Navigation recipient");
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toBeVisible();
+  await page.goBack();
+  await expect(
+    page.getByRole("heading", { name: "Dashboard", exact: true }),
+  ).toBeVisible();
+  await navigate(page, "Settings");
+  await expect(page.getByRole("list", { name: "발급한 MCP 키" })).toContainText(
+    "Navigation recipient",
+  );
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveCount(0);
+  state.mcpCreateDelay = 700;
+  await page.getByLabel("MCP 키 이름", { exact: true }).fill("Late recipient");
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect
+    .poll(
+      () =>
+        state.calls.filter(
+          (call) => call.path === "/api/mcp/keys" && call.method === "POST",
+        ).length,
+    )
+    .toBe(2);
+  await page.goBack();
+  await page.waitForTimeout(1000);
+  await navigate(page, "Settings");
+  await expect(page.getByRole("list", { name: "발급한 MCP 키" })).toContainText(
+    "Late recipient",
+  );
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveCount(0);
+  state.mcpCreateDelay = 0;
+  await page
+    .getByLabel("MCP 키 이름", { exact: true })
+    .fill("Expiry recipient");
+  await page.getByRole("button", { name: "MCP 키 발급", exact: true }).click();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toBeVisible();
+  // Exercise the same event fired by api() on an actual owner API 401.
+  state.authenticated = false;
+  await page.evaluate(() =>
+    window.dispatchEvent(new Event("owner-session-expired")),
+  );
+  await expect(
+    page.getByRole("heading", { name: "관리자 로그인" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("새 MCP 키", { exact: true })).toHaveCount(0);
+  await page
+    .getByLabel("관리자 비밀번호", { exact: true })
+    .fill("synthetic-owner-password");
+  await page.getByRole("button", { name: "로그인", exact: true }).click();
+  await expect(page.getByRole("list", { name: "발급한 MCP 키" })).toContainText(
+    "Expiry recipient",
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await page.evaluate(() => ({ ...localStorage }))).toEqual({
+    "use-theme": "dark",
+  });
+  expect(await page.evaluate(() => ({ ...sessionStorage }))).toEqual({});
   expect(state.unexpected).toEqual([]);
 });
 

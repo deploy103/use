@@ -234,7 +234,7 @@ export function ProviderLogin({
       <DialogContent>
         <DialogTitle>{names[provider]} 계정 연결</DialogTitle>
         <DialogDescription>
-          서비스 제공자의 공식 인증으로 연결합니다. Use 관리자 로그인과
+          서비스 제공자의 공식 인증으로 연결합니다. AI 대시보드 관리자 로그인과
           별개이며, 제공자 비밀번호를 여기에 입력하지 마세요.
         </DialogDescription>
         <div className="notice">

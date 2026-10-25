@@ -8,6 +8,12 @@ import type {
 
 // Deliberately synthetic. These values never enter production source or a live
 // server. Every API request is intercepted and unknown/external requests blocked.
+export const syntheticMcpToken = "synthetic-mcp-key-not-a-real-credential";
+export const mcpKeyFixture = (index: number) => ({
+  id: `synthetic-mcp-${index}`,
+  name: `Trusted recipient ${index}`,
+  created_at: "2026-10-25T07:00:00Z",
+});
 export const emptyMetrics: Metrics = {
   requests: null,
   input_tokens: null,
@@ -230,6 +236,10 @@ export type MockState = {
   completeDelay: number;
   testReadable: boolean;
   unexpected: string[];
+  mcpKeys: ReturnType<typeof mcpKeyFixture>[];
+  mcpFailure: "GET" | "POST" | "DELETE" | null;
+  mcpCreateDelay: number;
+  mcpNextId: number;
 };
 export async function mockBackend(
   page: Page,
@@ -246,6 +256,10 @@ export async function mockBackend(
     completeDelay: 0,
     testReadable: true,
     unexpected: [],
+    mcpKeys: [],
+    mcpFailure: null,
+    mcpCreateDelay: 0,
+    mcpNextId: 1,
   };
   const respond = (route: Route, json: unknown, status = 200) =>
     route.fulfill({
@@ -308,6 +322,31 @@ export async function mockBackend(
     if (path === "/api/refresh") return respond(route, { started: true });
     if (path === "/api/settings/password")
       return respond(route, { authenticated: true });
+    if (path === "/api/mcp/keys" || path.startsWith("/api/mcp/keys/")) {
+      if (state.mcpFailure === method)
+        return respond(route, { detail: "합성 MCP 서버 일시 오류" }, 503);
+      if (path === "/api/mcp/keys" && method === "GET")
+        return respond(route, { keys: state.mcpKeys });
+      if (path === "/api/mcp/keys" && method === "POST") {
+        if (state.mcpCreateDelay)
+          await new Promise((resolve) =>
+            setTimeout(resolve, state.mcpCreateDelay),
+          );
+        const name = typeof body?.name === "string" ? body.name.trim() : "";
+        if (!name || name.length > 100)
+          return respond(route, { detail: "키 이름은 1~100자입니다." }, 400);
+        if (state.mcpKeys.length >= 20)
+          return respond(route, { detail: "MCP 키는 최대 20개입니다." }, 400);
+        const key = { ...mcpKeyFixture(state.mcpNextId++), name };
+        state.mcpKeys.push(key);
+        return respond(route, { ...key, token: syntheticMcpToken });
+      }
+      if (path.startsWith("/api/mcp/keys/") && method === "DELETE") {
+        const id = decodeURIComponent(path.split("/").at(-1)!);
+        state.mcpKeys = state.mcpKeys.filter((key) => key.id !== id);
+        return respond(route, { deleted: true });
+      }
+    }
     if (path === "/api/connections/test")
       return respond(route, {
         ok: true,

@@ -207,9 +207,9 @@ function App() {
     <div className="auth-screen">
       <div className="auth-card space-y-6">
         <div className="brand !p-0">
-          <span className="brand-mark">u</span>
+          <span className="brand-mark">AI</span>
           <span>
-            Use<span className="brand-caption">AI USAGE WORKSPACE</span>
+            AI 대시보드<span className="brand-caption">AI USAGE WORKSPACE</span>
           </span>
         </div>
         <div>
@@ -218,7 +218,7 @@ function App() {
             {session?.setup_required ? "소유자 첫 설정" : "관리자 로그인"}
           </h1>
           <p className="text-xs muted mt-2">
-            내 사용량 워크스페이스에 로그인합니다.
+            AI 대시보드에 로그인합니다.
             <br />
             Claude·Gemini·ChatGPT 계정 연결은 로그인 후 진행합니다.
           </p>
