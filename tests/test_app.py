@@ -76,6 +76,8 @@ async def api(tmp_path, monkeypatch, app_module):
     monkeypatch.setenv("ATLAS_PASSWORD_FILE", str(tmp_path / "owner.password"))
     monkeypatch.setenv("ATLAS_KEY_FILE", str(tmp_path / "encryption.key"))
     monkeypatch.setenv("ATLAS_COOKIE_SECURE", "false")
+    monkeypatch.setenv("ATLAS_GEMINI_CLIENT_ID", "synthetic-client.apps.googleusercontent.com")
+    monkeypatch.setenv("ATLAS_GEMINI_CLIENT_SECRET", "synthetic-client-secret")
     monkeypatch.delenv("ATLAS_PUBLIC_ORIGIN", raising=False)
     fake = FakeCollector()
     application = app_module.create_app(tmp_path, collector=fake, poll_seconds=0)
@@ -154,7 +156,10 @@ async def test_owner_routes_require_authentication(api, method, path):
 @pytest.mark.asyncio
 async def test_one_time_setup_password_cookie_login_and_logout(api):
     client, _, root = api
-    session = (await client.get("/api/session")).json()
+    session_response = await client.get("/api/session")
+    assert set(session_response.headers["cache-control"].split(", ")) == {"no-store", "no-transform"}
+    assert "script-src 'self'" in session_response.headers["content-security-policy"]
+    session = session_response.json()
     assert session == {"authenticated": False, "setup_required": True}
     token = (root / "setup.token").read_text().strip()
     response = await client.post("/api/setup", json={"token": "wrong", "password": PASSWORD})
@@ -1147,3 +1152,112 @@ def test_public_origin_must_be_an_explicit_https_origin(tmp_path, monkeypatch, a
     monkeypatch.setenv("ATLAS_PUBLIC_ORIGIN", origin)
     with pytest.raises(ValueError, match="HTTPS origin"):
         app_module.create_app(tmp_path, collector=FakeCollector(), poll_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_gemini_browser_completion_persists_real_quota_and_deletes_credentials(owner, monkeypatch):
+    client, _, root = owner
+    requests = []
+
+    def provider(request):
+        requests.append(request)
+        responses = {
+            "https://oauth2.googleapis.com/token": {
+                "access_token": "synthetic-access", "refresh_token": "synthetic-refresh",
+                "token_type": "Bearer", "expires_in": 3600,
+            },
+            "https://www.googleapis.com/oauth2/v2/userinfo": {"id": "synthetic-user"},
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": {
+                "currentTier": {"id": "free-tier"}, "cloudaicompanionProject": "test-project",
+            },
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota": {
+                "buckets": [{"modelId": "gemini-pro", "remainingFraction": 0.37,
+                             "resetTime": "2026-10-26T00:00:00Z"}],
+            },
+        }
+        assert str(request.url) in responses
+        return httpx.Response(200, json=responses[str(request.url)])
+
+    real_client = httpx.AsyncClient
+    def provider_client(**options):
+        assert options["trust_env"] is False
+        return real_client(**options, transport=httpx.MockTransport(provider))
+    monkeypatch.setattr(httpx, "AsyncClient", provider_client)
+    response = await client.post("/api/oauth/start", json={"provider": "gemini", "name": "Personal Gemini"})
+    assert response.status_code == 200, response.text
+    flow = response.json()
+    assert flow["callback_mode"] == "code" and flow["provider"] == "gemini"
+    assert flow["authorization_url"].startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+    assert (await dashboard(client))["accounts"] == []
+    response = await client.post(f"/api/oauth/{flow['id']}/complete", json={"callback_input": "4/synthetic-code"})
+    assert response.status_code == 200 and response.json()["status"] == "connected", response.text
+    data = await settled(client)
+    account, = data["accounts"]
+    assert account["provider"] == "gemini-account" and account["has_credentials"]
+    assert account["status"] == "connected" and account["last_success_at"]
+    assert account["quota"][0]["label"] == "gemini-pro"
+    assert account["quota"][0]["remaining"] == 37
+    assert data["totals"]["total_tokens"] is None and data["models"] == []
+    assert "synthetic-access" not in str(data) and "synthetic-refresh" not in str(data)
+    credential = root / "subscriptions" / (flow["id"] + ".enc")
+    assert credential.exists() and b"synthetic-access" not in credential.read_bytes()
+    assert (await client.patch(f"/api/accounts/{flow['id']}", json={"credential": "wrong"})).status_code == 400
+    assert (await client.patch(f"/api/accounts/{flow['id']}", json={"name": "Renamed", "enabled": False})).status_code == 200
+    await settled(client)
+    assert (await client.delete(f"/api/accounts/{flow['id']}")).status_code == 200
+    assert not credential.exists() and (await dashboard(client))["accounts"] == []
+    assert len(requests) >= 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["chatgpt", "gemini"])
+async def test_oauth_flows_are_bound_to_starting_session_on_every_route(owner, provider):
+    client, _, _ = owner
+    started = await client.post("/api/oauth/start", json={"provider": provider, "name": "Personal"})
+    assert started.status_code == 200, started.text
+    flow_id = started.json()["id"]
+    assert (await client.post("/api/login", json={"password": PASSWORD})).status_code == 200
+    assert (await client.get(f"/api/oauth/{flow_id}")).status_code == 404
+    assert (await client.post(f"/api/oauth/{flow_id}/complete", json={"callback_input": "wrong"})).status_code == 404
+    assert (await client.delete(f"/api/oauth/{flow_id}")).status_code == 404
+    if provider == "chatgpt":
+        assert (await client.get(f"/api/chatgpt/login/{flow_id}")).status_code == 404
+        assert (await client.post(f"/api/chatgpt/login/{flow_id}/complete", json={"callback_url": "wrong"})).status_code == 404
+        assert (await client.delete(f"/api/chatgpt/login/{flow_id}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_connection_probe_does_not_save_accounts_or_echo_credentials(owner, monkeypatch):
+    client, _, _ = owner
+    async def probe(self, account):
+        assert account["provider"] == "custom-api" and account["credential"] == "synthetic-probe-key"
+        return {"records": [record()], "quota": [], "capabilities": ["tokens"], "note": "Read-only usage."}
+    monkeypatch.setattr(FakeCollector, "__call__", probe)
+    response = await client.post("/api/connections/test", json={
+        "provider": "custom-api", "credential": "synthetic-probe-key",
+        "base_url": "https://usage.example.com", "extra": {"auth_type": "auto"},
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] and response.json()["capabilities"] == ["tokens"]
+    assert "records" not in response.json() and "synthetic-probe-key" not in response.text
+    assert (await dashboard(client))["accounts"] == []
+
+
+@pytest.mark.asyncio
+async def test_password_change_checks_current_and_revokes_other_sessions(owner):
+    client, _, root = owner
+    old_cookie = client.cookies.get("atlas_session")
+    new_password = "replacement-pass123"
+    assert (await client.post("/api/settings/password", json={
+        "current_password": "wrong", "new_password": new_password,
+    })).status_code == 400
+    assert (await client.get("/api/session")).json()["authenticated"]
+    assert (await client.post("/api/settings/password", json={
+        "current_password": PASSWORD, "new_password": new_password,
+    })).status_code == 200
+    assert client.cookies.get("atlas_session") != old_cookie
+    assert (root / "owner.password").stat().st_mode & 0o777 == 0o600
+    assert (await client.get("/api/dashboard", headers={"Cookie": "atlas_session=" + old_cookie})).status_code == 401
+    assert (await client.get("/api/dashboard")).status_code == 200
+    assert (await client.post("/api/login", json={"password": PASSWORD})).status_code == 401
+    assert (await client.post("/api/login", json={"password": new_password})).status_code == 200

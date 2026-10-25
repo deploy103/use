@@ -2,20 +2,23 @@
 
 **여러 AI 계정의 사용량과 남은 한도를 한 화면에서.**
 
-ChatGPT · Codex LB · Claude LB · Gemini LB · xAI · OpenAI API
+ChatGPT · Claude · Gemini · Custom API
 
 Use는 개인 운영자를 위한 AI 사용량 대시보드입니다. 여러 계정을 연결하고,
 토큰·요청·비용·잔여 한도를 확인합니다. 추론 프록시가 아니며 모델을 호출하지 않습니다.
 
 ## 무엇을 보여주나요?
 
-- 서비스별 탭과 다중 계정 관리
+- 대시보드 · 계정 · 사용량 · 설정, 다중 계정 관리
+- codex-lb 기반 레이아웃과 Dither Kit 컴포넌트, 라이트·다크 테마
+- 연결된 계정의 잔여 한도·초기화 시각·마지막 성공을 먼저 표시
 - 오늘 / 7일 / 30일 / 전체 기간 필터, 일별 추이와 모델별 집계
 - 공급자가 제공하는 구독 한도와 초기화 시각
 - 전체 또는 계정별 새로고침, 마지막 성공 데이터 보존
 - 필터를 반영하는 CSV 내보내기
-- 관리자 암호, 서버 측 세션, 암호화된 연결 정보
-- 빌드 단계 없는 FastAPI + SQLite + 정적 웹 UI
+- 연결 전 사용량 API 테스트, 전체 또는 계정별 연결 관리
+- 관리자 암호 변경, 서버 측 세션, 암호화된 연결 정보
+- React · TypeScript · Vite 프런트엔드, FastAPI · SQLite 백엔드
 
 **알 수 없는 값은 `—`로 표시합니다.** 누적 카운터를 일별 통계로 만들거나,
 구독 한도를 토큰으로 환산하지 않습니다. 같은 트래픽을 여러 연결에서 수집하면
@@ -26,14 +29,17 @@ Use는 개인 운영자를 위한 AI 사용량 대시보드입니다. 여러 계
 | 연결 | 필요한 인증 | 조회 범위 |
 | --- | --- | --- |
 | ChatGPT / Codex | OpenAI 브라우저 OAuth | Codex 구독 한도·크레딧. ChatGPT 전체 대화의 토큰 기록은 아님 |
+| Claude | Anthropic 조직 Admin API key | UTC 일별·모델별 토큰, 별도 조직 비용. Claude.ai Pro/Max 구독과 별개 |
+| Gemini 계정 | Google 브라우저 OAuth + 인증 코드 | Gemini CLI / Code Assist의 모델별 잔여 한도. Gemini 웹 대화 기록은 아님 |
 | Codex LB | HTTPS 서버 주소 + gateway key | 해당 키의 누적 토큰·요청·비용 환산액·잔여 한도 |
 | Claude LB | HTTPS 서버 주소 + 조회 키 | 해당 키의 누적 사용량과 세션·일·주 한도 |
 | Gemini LB | HTTPS 서버 주소 + gateway key | gateway의 누적 사용량과 독립된 한도 창 |
 | OpenAI API | 조직 Admin API key | API 조직의 일별·모델별 사용량 및 별도 조직 비용 |
 | Grok / xAI API | Management key + Team ID | 일별 API 지출. 현재 연동은 토큰·요청 수를 제공하지 않음 |
 | Trusted usage JSON | HTTPS origin + 선택적 Bearer key | 아래 공통 수집 형식으로 제공된 데이터 |
+| 기타 → 커스텀 API | HTTPS URL + 선택적 조회 키 | 지원되는 사용량 endpoint 자동 탐지 또는 경로·인증·응답 형식 지정 |
 
-Google·Grok 소비자 구독 로그인을 지원한다고 표시하지 않습니다. LB 비용은 설정된
+Grok 소비자 구독 로그인을 지원한다고 표시하지 않습니다. LB 비용은 설정된
 환산액일 수 있으며 공급자의 실제 청구서와 다릅니다. 누적 사용량은 기간별 합계와
 분리해서 표시합니다. OpenAI API 집계의 일자 경계는 공급자의 UTC 기준입니다.
 
@@ -55,15 +61,39 @@ Use는 OpenAI 암호를 받지 않으며 기기 인증 코드를 사용하지 �
 분석 API가 아니며, 공급자 정책과 API 변경에 따라 동작이 달라질 수 있습니다.
 본인의 계정과 신뢰하는 Use 서버에서만 사용하세요.
 
+### Claude · Gemini · 기타 연결
+
+- **Claude:** 조직 Admin 조회 키 또는 Claude LB 주소·조회 키를 선택합니다.
+  일반 추론 API key와 Admin key는 다릅니다. [Anthropic 인증 정책](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)에
+  따라 Claude.ai 소비자 계정의 OAuth 토큰을 수집하는 제3자 로그인은 제공하지 않습니다.
+- **Gemini:** Google 인증 페이지에서 승인한 뒤 표시되는 **인증 코드만** 붙여 넣습니다.
+  이메일 식별과 Code Assist 조회에 필요한 범위를 요청하며, 암호를 받지 않습니다.
+  흐름은 5분 후 만료됩니다. 계정의 기존 Code Assist 설정이 필요하며 프로젝트 생성,
+  결제 활성화, 약관 동의 자동 처리나 모델 호출은 하지 않습니다.
+  운영자는 아래 환경 변수로 이 인증 방식과 Code Assist에 호환되는 OAuth 클라이언트를
+  별도 설정해야 합니다. 저장소에는 클라이언트 ID·secret을 포함하지 않으며,
+  설정이 없으면 인증을 시작하지 않습니다. 임의의 Google OAuth 앱이 Code Assist에
+  접근할 수 있다고 보장하지 않습니다.
+- **기타 → 커스텀 API:** 공급자 URL과 조회 키를 넣고 연결을 테스트합니다.
+  기본 자동 탐지는 `/v1/usage`, `/v1/usage/self`, `/usage.json`을 순서대로 읽습니다.
+  `Bearer` 또는 `x-api-key` 인증과 경로·응답 형식을 직접 지정할 수도 있습니다.
+  추론 API 호환만으로 사용량 조회가 가능한 것은 아닙니다. 서버가 지원되는
+  사용량 JSON을 제공해야 하며, 실패를 사용량 0으로 표시하지 않습니다.
+
+브라우저 인증 요청은 시작한 관리자 세션에 묶입니다. OAuth·조회 키는 서버에서
+암호화하여 저장하며, 연결 삭제는 로컬 자격 증명 삭제이지 공급자 측 권한 철회가 아닙니다.
+
 ## 빠른 시작
 
-Python 3.11 이상과 Linux를 권장합니다.
+Python 3.11 이상, Node.js 22.12 이상, Linux를 권장합니다. 프런트엔드는 배포 전에 빌드합니다.
 
 ```bash
 git clone https://github.com/deploy103/use.git
 cd use
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
 umask 077
 ATLAS_DATA_DIR=./data .venv/bin/uvicorn app:app \
   --host 127.0.0.1 --port 8080 --no-proxy-headers
@@ -88,12 +118,17 @@ ATLAS_DATA_DIR=./data .venv/bin/uvicorn app:app \
 | `ATLAS_COOKIE_SECURE` | `true`이면 Secure cookie. 공개 origin을 지정하면 자동 강제 |
 | `ATLAS_PASSWORD_FILE` | `<data>/owner.password` — scrypt 관리자 암호 해시 |
 | `ATLAS_KEY_FILE` | `<data>/encryption.key` — Fernet 암호화 키 |
+| `ATLAS_GEMINI_CLIENT_ID` | Gemini 연결용 호환 OAuth 클라이언트 ID. 기본값 없음 |
+| `ATLAS_GEMINI_CLIENT_SECRET` | 해당 OAuth 클라이언트 secret. 기본값 없음 |
 
+Gemini 클라이언트 설정은 Git 밖의 권한 `0600` 파일에 보관하고 systemd의
+`EnvironmentFile=`로 주입하세요. 실제 값은 서비스 예제·README·커밋에 넣지 마세요.
 환경 변수 접두사 `ATLAS_`는 기존 설치와의 호환성을 위해 유지합니다.
 프록시는 원래 `Host`를 보존해야 합니다. 서버는 전달 헤더로 신뢰 대상을 바꾸지 않고
 실제 Host와 브라우저 Origin을 검사합니다. `/api/*`는 캐시하지 마세요.
 관리자 세션은 HttpOnly·SameSite=Strict이며 인증되지 않은 API 조회는 거부됩니다.
 관리자 계정 하나를 위한 앱으로, 공개 회원 가입이나 다중 사용자 격리는 제공하지 않습니다.
+빌드된 `web-dist/`를 Python 소스와 함께 배포합니다. 운영 서버에 Node.js는 필요하지 않습니다.
 
 암호화 키와 DB는 함께 비공개 백업하세요. 같은 서버의 키를 가진 관리자는 연결된
 인증 정보를 복호화할 수 있습니다. 재설치 중 키를 새로 만들면 기존 인증 정보를
@@ -104,6 +139,8 @@ ATLAS_DATA_DIR=./data .venv/bin/uvicorn app:app \
 Trusted usage JSON은 검증된 HTTPS origin의 `GET /usage.json`만 읽습니다.
 선택적 인증은 `Authorization: Bearer <credential>`입니다. 리다이렉트와 사설망
 대상은 허용하지 않습니다. 임의 URL 경로나 로컬 파일을 읽지 않습니다.
+커스텀 API 모드에서는 운영자가 HTTPS base path·port와 상대 사용량 경로를 지정할 수 있지만,
+동일한 공개망 제한과 DNS 고정 검사를 적용합니다.
 
 ```json
 {
@@ -133,8 +170,10 @@ Trusted usage JSON은 검증된 HTTPS origin의 `GET /usage.json`만 읽습니�
 
 ```bash
 .venv/bin/python -m pytest -q
-node --check static/app.js
-ruff check app.py collectors.py chatgpt.py
+npm --prefix frontend run build
+npm --prefix frontend exec -- playwright install chromium
+npm --prefix frontend test
+ruff check app.py collectors.py chatgpt.py subscriptions.py
 ```
 
 테스트는 가짜 공급자 응답과 임시 데이터를 사용합니다. 실제 공급자 로그인 성공이나
@@ -142,7 +181,9 @@ ruff check app.py collectors.py chatgpt.py
 
 ## 출처
 
-ChatGPT 인증 프로토콜의 일부는 MIT 라이선스의
+레이아웃·UI 일부와 ChatGPT 인증 프로토콜은 MIT 라이선스의
 [Soju06/codex-lb](https://github.com/Soju06/codex-lb)를 참고·수정했습니다.
-해당 저작권과 MIT 고지는 `chatgpt.py`에 보존되어 있습니다.
+[Dither Kit](https://www.tripwire.sh/dither-kit) 컴포넌트와 Google Gemini CLI의
+설치형 클라이언트 인증 방식도 사용합니다. 원본·리비전·라이선스와 수정 범위는
+[`licenses/`](licenses/)와 `chatgpt.py`의 저작권 고지에 보존합니다.
 Use는 OpenAI, Anthropic, Google, xAI의 공식 제품이 아닙니다.

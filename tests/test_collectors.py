@@ -72,14 +72,112 @@ def page(results=None, stamp=1792713600, more=False, cursor=None):
     }
 
 
+def test_claude_admin_separates_models_cache_tokens_and_decimal_cent_costs(service):
+    def respond(request):
+        assert request.headers["x-api-key"] == TOKEN
+        assert request.headers["anthropic-version"] == "2023-06-01"
+        assert "authorization" not in request.headers
+        assert request.url.params["bucket_width"] == "1d"
+        if request.url.path.endswith("usage_report/messages"):
+            assert request.url.params.get_list("group_by[]") == ["model"]
+            rows = [
+                {
+                    "model": "claude-sonnet",
+                    "uncached_input_tokens": 13,
+                    "output_tokens": 7,
+                    "cache_read_input_tokens": 19,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 2,
+                        "ephemeral_1h_input_tokens": 5,
+                    },
+                },
+                {
+                    "model": "claude-opus",
+                    "uncached_input_tokens": 3,
+                    "output_tokens": 11,
+                    "cache_read_input_tokens": 0,
+                },
+            ]
+        else:
+            assert request.url.path == "/v1/organizations/cost_report"
+            assert "group_by[]" not in request.url.params
+            rows = [
+                {"amount": "123.78912", "currency": "USD"},
+                {"amount": "-23.45", "currency": "USD"},
+            ]
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"starting_at": "2026-10-23T00:00:00Z", "results": rows}],
+                "has_more": False,
+            },
+        )
+
+    requests = service(handler=respond)
+    result = collect(account("claude", extra={"days": 7}))
+    assert len(requests) == 2
+    by_model = {item["model"]: item for item in result["records"]}
+    assert by_model["claude-sonnet"]["input_tokens"] == 13
+    assert by_model["claude-sonnet"]["cache_write_tokens"] == 7
+    assert by_model["claude-sonnet"]["cache_read_tokens"] == 19
+    assert by_model["claude-opus"]["cache_write_tokens"] is None
+    assert by_model["claude-opus"]["requests"] is None
+    assert by_model["claude-sonnet"]["cost_usd"] is None
+    assert by_model["[organization costs]"]["cost_usd"] == pytest.approx(1.0033912)
+    assert by_model["[organization costs]"]["input_tokens"] is None
+    assert result["capabilities"] == ["tokens", "cost"] and result["quota"] == []
+
+
+@pytest.mark.parametrize(
+    "currency,amount", [("usd", "123"), ("EUR", "123"), ("USD", 123), ("USD", "NaN")]
+)
+def test_claude_admin_rejects_unsupported_costs_atomically(service, currency, amount):
+    def respond(request):
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "starting_at": "2026-10-23T00:00:00Z",
+                        "results": [
+                            {"amount": amount, "currency": currency},
+                        ],
+                    }
+                ]
+                if request.url.path.endswith("cost_report")
+                else [],
+                "has_more": False,
+            },
+        )
+
+    service(handler=respond)
+    with pytest.raises(collectors.CollectionError):
+        collect(account("claude"))
+
+
+def test_claude_admin_rejects_repeated_pagination_buckets(service):
+    service(
+        {
+            "data": [{"starting_at": "2026-10-23T00:00:00Z", "results": []}],
+            "has_more": True,
+            "next_page": "same-cursor",
+        }
+    )
+    with pytest.raises(collectors.CollectionError):
+        collect(account("claude"))
+
+
 def test_provider_metadata_is_public_and_complete():
     assert {p["id"] for p in collectors.PROVIDERS} == {
+        "claude",
+        "gemini-account",
         "chatgpt",
         "claude-lb",
         "openai",
         "gemini",
         "grok",
         "codex-lb",
+        "custom-api",
         "usage-json",
     }
     for provider in collectors.PROVIDERS:
@@ -727,3 +825,116 @@ def test_claude_invalid_schema_cannot_be_reported_as_zero(service):
     service({"message": "login required"})
     with pytest.raises(collectors.CollectionError, match="invalid"):
         collect(account("claude-lb"))
+
+
+@pytest.mark.parametrize("suffix", ["", "/", "/v1", "/v1/"])
+def test_custom_api_accepts_client_base_url_without_doubling_v1(service, suffix):
+    requests = service(
+        {
+            "request_count": 7,
+            "total_tokens": 4321,
+            "cached_input_tokens": 23,
+            "limits": [],
+            "account_pool_usage": {"primary": 68, "secondary": 0},
+        }
+    )
+    result = collect(
+        account("custom-api", base_url="https://usage.example.com" + suffix)
+    )
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/usage"
+    assert requests[0].headers["authorization"] == "Bearer " + TOKEN
+    assert "x-api-key" not in requests[0].headers
+    assert result["summary"]["total_tokens"] == 4321
+    assert result["records"] == []
+    assert [q["remaining"] for q in result["quota"]] == [68, 0]
+
+
+def test_custom_api_autodetects_claude_usage_and_changes_auth_only_for_self(service):
+    def respond(request):
+        if request.url.path == "/v1/usage":
+            return httpx.Response(404, json={"error": "not found"})
+        assert request.url.path == "/v1/usage/self"
+        assert request.headers["x-api-key"] == TOKEN
+        assert "authorization" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "request_count": 2,
+                "total_tokens": 300,
+                "cached_input_tokens": 10,
+                "limits": [
+                    {
+                        "limit_type": "cost_usd",
+                        "limit_window": "daily",
+                        "max_value": 8_000_000,
+                        "remaining_value": 6_000_000,
+                        "used_percent": 25,
+                    }
+                ],
+            },
+        )
+
+    requests = service(handler=respond)
+    result = collect(account("custom-api", base_url="https://usage.example.com"))
+    assert len(requests) == 2
+    assert result["quota"][0]["limit"] == 8
+    assert result["quota"][0]["remaining"] == 6
+    assert result["summary"]["cost_usd"] is None
+
+
+def test_custom_explicit_json_path_port_and_auth_preserve_actual_dated_values(service):
+    requests = service(
+        {"records": [row(input_tokens=13, output_tokens=7)], "capabilities": ["tokens"]}
+    )
+    result = collect(
+        account(
+            "custom-api",
+            base_url="https://usage.example.com:8443/team/v1",
+            extra={
+                "usage_path": "/stats/usage",
+                "format": "usage-json",
+                "auth_type": "x-api-key",
+            },
+        )
+    )
+    assert len(requests) == 1
+    assert requests[0].url.port == 8443
+    assert requests[0].url.path == "/team/stats/usage"
+    assert requests[0].headers["x-api-key"] == TOKEN
+    assert "authorization" not in requests[0].headers
+    assert result["records"][0]["input_tokens"] == 13
+    assert result["records"][0]["output_tokens"] == 7
+    assert result["records"][0]["cache_read_tokens"] is None
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"usage_path": "https://other.example/usage"},
+        {"usage_path": "//other.example"},
+        {"usage_path": "/../secret"},
+        {"usage_path": "/a/%2e%2e/secret"},
+        {"usage_path": "/stats?key=secret"},
+        {"format": "messages"},
+        {"auth_type": "cookie"},
+    ],
+)
+def test_custom_invalid_settings_do_not_send_requests(extra):
+    with pytest.raises(collectors.CollectionError):
+        collect(
+            account("custom-api", base_url="https://usage.example.com", extra=extra)
+        )
+
+
+def test_custom_inference_only_server_is_not_reported_as_connected(service):
+    requests = service({"error": TOKEN}, status=404)
+    with pytest.raises(collectors.CollectionError, match="사용량 API") as error:
+        collect(account("custom-api", base_url="https://usage.example.com"))
+    assert TOKEN not in str(error.value)
+    assert [r.url.path for r in requests] == [
+        "/v1/usage",
+        "/v1/usage/self",
+        "/usage.json",
+    ]
+    assert all(r.method == "GET" for r in requests)

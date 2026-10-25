@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 import chatgpt
 import collectors
+import subscriptions
 
 METRICS = (
     "requests",
@@ -33,7 +34,8 @@ METRICS = (
     "cost_usd",
 )
 KST = ZoneInfo("Asia/Seoul")
-STATIC = Path(__file__).parent / "static"
+STATIC = Path(__file__).parent / "web-dist"
+OAUTH_PROVIDERS = {"chatgpt", "gemini-account"}
 
 
 def utcnow():
@@ -128,14 +130,16 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
     attempts = {}
     collect = collector or collectors.collect
 
-    async def chatgpt_connected(account_id, name):
+    async def oauth_connected(account_id, name, provider):
+        provider = "gemini-account" if provider == "gemini" else provider
+        metadata = next(p for p in collectors.PROVIDERS if p["id"] == provider)
         encrypted = cipher.encrypt(
             json.dumps({"credential": "", "extra": {}}).encode()
         ).decode()
         with db() as c:
             if c.execute(
-                "SELECT 1 FROM accounts WHERE id=? AND provider='chatgpt'",
-                (account_id,),
+                "SELECT 1 FROM accounts WHERE id=? AND provider=?",
+                (account_id, provider),
             ).fetchone():
                 return
             if c.execute("SELECT count(*) FROM accounts").fetchone()[0] >= 50:
@@ -144,11 +148,21 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
                 )
             c.execute(
                 "INSERT INTO accounts(id,name,provider,base_url,secret) VALUES (?,?,?,?,?)",
-                (account_id, name, "chatgpt", "https://chatgpt.com", encrypted),
+                (account_id, name, provider, metadata["default_url"], encrypted),
             )
         start_refresh([account_id])
 
+    async def chatgpt_connected(account_id, name):
+        await oauth_connected(account_id, name, "chatgpt")
+
     chatgpt_accounts = chatgpt.ChatGPTManager(root, cipher, chatgpt_connected)
+    subscription_accounts = subscriptions.SubscriptionManager(
+        root, cipher, oauth_connected
+    )
+    oauth_flows = {}
+
+    def account_manager(provider):
+        return chatgpt_accounts if provider == "chatgpt" else subscription_accounts
 
     def store_result(account_id, result):
         records = result.get("records", [])
@@ -233,9 +247,11 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
                     "UPDATE accounts SET last_attempt_at=? WHERE id=?",
                     (utcnow(), account_id),
                 )
-            if account["provider"] not in ("chatgpt", "usage-json") and not account.get(
-                "credential"
-            ):
+            if account["provider"] not in (
+                *OAUTH_PROVIDERS,
+                "usage-json",
+                "custom-api",
+            ) and not account.get("credential"):
                 with db() as c:
                     c.execute(
                         "UPDATE accounts SET status='needs_auth',error=? WHERE id=?",
@@ -244,8 +260,8 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
                 return
             try:
                 operation = (
-                    chatgpt_accounts.collect(account_id)
-                    if account["provider"] == "chatgpt"
+                    account_manager(account["provider"]).collect(account_id)
+                    if account["provider"] in OAUTH_PROVIDERS
                     else collect(account)
                 )
                 result = await asyncio.wait_for(operation, timeout=120)
@@ -294,6 +310,7 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
             *([timer] if timer else []), *tasks, return_exceptions=True
         )
         await chatgpt_accounts.close()
+        await subscription_accounts.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.root = root
@@ -301,6 +318,7 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
     app.state.cipher = cipher
     app.state.refresh_one = refresh_one
     app.state.chatgpt = chatgpt_accounts
+    app.state.subscriptions = subscription_accounts
 
     def authenticated(request):
         token = request.cookies.get("atlas_session", "")
@@ -350,7 +368,7 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
         response = await call_next(request)
         response.headers.update(
             {
-                "Cache-Control": "no-store",
+                "Cache-Control": "no-store, no-transform",
                 "X-Content-Type-Options": "nosniff",
                 "X-Frame-Options": "DENY",
                 "Referrer-Policy": "no-referrer",
@@ -463,6 +481,155 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
     def providers():
         return {"providers": collectors.PROVIDERS}
 
+    @app.post("/api/settings/password")
+    async def change_password(request: Request):
+        rate_limit(request)
+        data = await body(request)
+        current, password = data.get("current_password"), data.get("new_password")
+        if not isinstance(current, str) or len(current) > 200:
+            raise HTTPException(400, "현재 비밀번호를 입력하세요.")
+        if not isinstance(password, str) or not 12 <= len(password) <= 200:
+            raise HTTPException(400, "새 비밀번호를 12~200자로 입력하세요.")
+        stored = password_file.read_text().strip()
+        if not hmac.compare_digest(
+            password_hash(current, stored.split(":")[0]), stored
+        ):
+            raise HTTPException(400, "현재 비밀번호가 일치하지 않습니다.")
+        temporary = password_file.with_name(
+            password_file.name + "." + secrets.token_hex(8)
+        )
+        try:
+            private_file(temporary, password_hash(password))
+            os.replace(temporary, password_file)
+        finally:
+            temporary.unlink(missing_ok=True)
+        with db() as c:
+            c.execute("DELETE FROM sessions")
+        return login_response()
+
+    def flow_snapshot(provider, result):
+        return {
+            **result,
+            "provider": provider,
+            "callback_mode": result.get("callback_mode", "url"),
+        }
+
+    def remember_flow(request, provider, result):
+        for key, flow in list(oauth_flows.items()):
+            if flow[2] < time.monotonic():
+                oauth_flows.pop(key)
+        oauth_flows[result["id"]] = (
+            provider,
+            hashlib.sha256(
+                request.cookies.get("atlas_session", "").encode()
+            ).hexdigest(),
+            time.monotonic() + 900,
+        )
+
+    def owned_flow(request, flow_id):
+        flow = oauth_flows.get(flow_id)
+        if (
+            not flow
+            or flow[2] < time.monotonic()
+            or not hmac.compare_digest(
+                flow[1],
+                hashlib.sha256(
+                    request.cookies.get("atlas_session", "").encode()
+                ).hexdigest(),
+            )
+        ):
+            raise HTTPException(
+                404, "이 브라우저의 연결 요청을 찾을 수 없습니다. 다시 시작하세요."
+            )
+        return flow[0], account_manager(flow[0])
+
+    @app.post("/api/oauth/start")
+    async def oauth_start(request: Request):
+        data = await body(request)
+        provider, name = data.get("provider"), data.get("name")
+        if (
+            provider not in ("gemini", "chatgpt")
+            or not isinstance(name, str)
+            or not 1 <= len(name.strip()) <= 100
+        ):
+            raise HTTPException(400, "서비스와 계정 이름을 확인하세요.")
+        with db() as c:
+            if c.execute("SELECT count(*) FROM accounts").fetchone()[0] >= 50:
+                raise HTTPException(400, "최대 50개 계정까지 연결할 수 있습니다.")
+        try:
+            result = await (
+                chatgpt_accounts.start(name.strip())
+                if provider == "chatgpt"
+                else subscription_accounts.start(provider, name.strip())
+            )
+        except collectors.CollectionError as exc:
+            raise HTTPException(400, str(exc)) from None
+        remember_flow(request, provider, result)
+        return flow_snapshot(provider, result)
+
+    @app.get("/api/oauth/{flow_id}")
+    async def oauth_status(flow_id: str, request: Request):
+        provider, manager = owned_flow(request, flow_id)
+        try:
+            return flow_snapshot(provider, await manager.status(flow_id))
+        except collectors.CollectionError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    @app.post("/api/oauth/{flow_id}/complete")
+    async def oauth_complete(flow_id: str, request: Request):
+        provider, manager = owned_flow(request, flow_id)
+        data = await body(request)
+        value = data.get("callback_input")
+        if (
+            set(data) != {"callback_input"}
+            or not isinstance(value, str)
+            or not 1 <= len(value) <= 8192
+        ):
+            raise HTTPException(
+                400, "인증 후 표시된 코드 또는 콜백 주소 전체를 입력하세요."
+            )
+        try:
+            return flow_snapshot(provider, await manager.complete(flow_id, value))
+        except collectors.CollectionError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.delete("/api/oauth/{flow_id}")
+    async def oauth_cancel(flow_id: str, request: Request):
+        _, manager = owned_flow(request, flow_id)
+        try:
+            await manager.cancel(flow_id)
+        except collectors.CollectionError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return {"cancelled": True}
+
+    @app.post("/api/connections/test")
+    async def connection_test(request: Request):
+        data = await body(request)
+        provider = data.get("provider")
+        if (
+            not isinstance(provider, str)
+            or provider not in {p["id"] for p in collectors.PROVIDERS} - OAUTH_PROVIDERS
+        ):
+            raise HTTPException(400, "사용량 API 연결 종류를 선택하세요.")
+        try:
+            result = await collect(
+                {
+                    "provider": provider,
+                    "base_url": data.get("base_url", ""),
+                    "credential": data.get("credential", ""),
+                    "extra": data.get("extra", {}),
+                }
+            )
+        except collectors.CollectionError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {
+            "ok": True,
+            **{
+                key: result.get(key)
+                for key in ("capabilities", "quota", "summary", "note")
+            },
+        }
+
     @app.post("/api/chatgpt/login")
     async def chatgpt_login(request: Request):
         data = await body(request)
@@ -473,19 +640,25 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
             if c.execute("SELECT count(*) FROM accounts").fetchone()[0] >= 50:
                 raise HTTPException(400, "최대 50개 계정까지 연결할 수 있습니다.")
         try:
-            return await chatgpt_accounts.start(name.strip())
+            result = await chatgpt_accounts.start(name.strip())
         except collectors.CollectionError as exc:
             raise HTTPException(400, str(exc)) from None
+        remember_flow(request, "chatgpt", result)
+        return result
 
     @app.get("/api/chatgpt/login/{login_id}")
-    async def chatgpt_login_status(login_id: str):
+    async def chatgpt_login_status(login_id: str, request: Request):
+        if owned_flow(request, login_id)[0] != "chatgpt":
+            raise HTTPException(404, "ChatGPT 연결 요청을 찾을 수 없습니다.")
         try:
             return await chatgpt_accounts.status(login_id)
         except collectors.CollectionError as exc:
             raise HTTPException(404, str(exc)) from None
 
     @app.delete("/api/chatgpt/login/{login_id}")
-    async def chatgpt_login_cancel(login_id: str):
+    async def chatgpt_login_cancel(login_id: str, request: Request):
+        if owned_flow(request, login_id)[0] != "chatgpt":
+            raise HTTPException(404, "ChatGPT 연결 요청을 찾을 수 없습니다.")
         try:
             await chatgpt_accounts.cancel(login_id)
         except collectors.CollectionError as exc:
@@ -494,6 +667,8 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
 
     @app.post("/api/chatgpt/login/{login_id}/complete")
     async def chatgpt_login_complete(login_id: str, request: Request):
+        if owned_flow(request, login_id)[0] != "chatgpt":
+            raise HTTPException(404, "ChatGPT 연결 요청을 찾을 수 없습니다.")
         data = await body(request)
         callback_url = data.get("callback_url")
         if (
@@ -511,8 +686,8 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
         a = dict(row)
         secret = json.loads(cipher.decrypt(a.pop("secret").encode()))
         a["has_credentials"] = (
-            chatgpt_accounts.has_credentials(a["id"])
-            if a["provider"] == "chatgpt"
+            account_manager(a["provider"]).has_credentials(a["id"])
+            if a["provider"] in OAUTH_PROVIDERS
             else bool(secret.get("credential"))
         )
         a["enabled"] = bool(a["enabled"])
@@ -532,11 +707,19 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
             if account_id and not old:
                 raise HTTPException(404, "계정을 찾을 수 없습니다.")
             provider = data.get("provider", old["provider"] if old else "")
-            if provider not in {p["id"] for p in collectors.PROVIDERS}:
+            if not isinstance(provider, str) or provider not in {
+                p["id"] for p in collectors.PROVIDERS
+            }:
                 raise HTTPException(400, "지원하지 않는 서비스입니다.")
-            if provider == "chatgpt" and (not old or set(data) - {"name", "enabled"}):
+            if provider in OAUTH_PROVIDERS and (
+                not old or set(data) - {"name", "enabled"}
+            ):
+                service = next(
+                    p["name"] for p in collectors.PROVIDERS if p["id"] == provider
+                )
                 raise HTTPException(
-                    400, "ChatGPT는 API 키 대신 ChatGPT 로그인 버튼으로 연결하세요."
+                    400,
+                    f"{service} 구독 계정은 API 키 대신 서비스 로그인 버튼으로 연결하세요.",
                 )
             name = data.get("name", old["name"] if old else "")
             url = data.get("base_url", old["base_url"] if old else "")
@@ -617,11 +800,11 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
             ).fetchone()
             if not row:
                 raise HTTPException(404, "계정을 찾을 수 없습니다.")
-            if row["provider"] == "chatgpt" and account_id in active:
+            if row["provider"] in OAUTH_PROVIDERS and account_id in active:
                 raise HTTPException(409, "수집 중입니다. 잠시 후 삭제하세요.")
-        if row["provider"] == "chatgpt":
+        if row["provider"] in OAUTH_PROVIDERS:
             try:
-                await chatgpt_accounts.remove(account_id)
+                await account_manager(row["provider"]).remove(account_id)
             except collectors.CollectionError as exc:
                 raise HTTPException(409, str(exc)) from None
         with db() as c:
@@ -740,10 +923,21 @@ def create_app(data_dir=None, collector=None, poll_seconds=300):
         return {"status": "ok"}
 
     @app.get("/")
+    @app.get("/dashboard")
+    @app.get("/accounts")
+    @app.get("/usage")
+    @app.get("/settings")
     def index():
+        if not (STATIC / "index.html").is_file():
+            raise HTTPException(
+                503, "프런트엔드를 먼저 빌드하세요: npm --prefix frontend run build"
+            )
         return FileResponse(STATIC / "index.html")
 
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    if (STATIC / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=STATIC / "assets"), name="assets")
+    if (STATIC / "fonts").is_dir():
+        app.mount("/fonts", StaticFiles(directory=STATIC / "fonts"), name="fonts")
     return app
 
 

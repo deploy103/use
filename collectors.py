@@ -16,6 +16,7 @@ import math
 import re
 import socket
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,20 @@ class CollectionError(Exception):
 
 
 PROVIDERS = [
+    {
+        "id": "claude",
+        "name": "Claude",
+        "default_url": "https://api.anthropic.com",
+        "help": "Claude API 조직의 Admin 조회 키로 일별·모델별 토큰과 조직 비용을 조회합니다. Claude.ai Pro/Max 구독 로그인과 별개이며, Claude LB는 별도 조회 키 모드를 선택하세요.",
+        "fields": [{"name": "days", "label": "조회 일수 (1–90)", "type": "number"}],
+    },
+    {
+        "id": "gemini-account",
+        "name": "Gemini",
+        "default_url": "https://cloudcode-pa.googleapis.com",
+        "help": "Google 계정으로 로그인하여 Gemini CLI / Code Assist 모델별 잔여 한도를 조회합니다. Gemini 웹 대화 기록이나 gateway 키와는 별개입니다.",
+        "fields": [],
+    },
     {
         "id": "chatgpt",
         "name": "ChatGPT 계정",
@@ -82,6 +97,17 @@ PROVIDERS = [
                 "label": "Lookback days (1–90, default 30)",
                 "type": "number",
             },
+        ],
+    },
+    {
+        "id": "custom-api",
+        "name": "커스텀 API",
+        "default_url": "",
+        "help": "기타 서비스의 서버 주소와 API 키를 연결합니다. 공개 HTTPS 사용량 API가 필요하며, 추론 API만 있는 서버의 전체 사용량은 조회할 수 없습니다.",
+        "fields": [
+            {"name": "usage_path", "label": "사용량 API 경로", "type": "text"},
+            {"name": "format", "label": "응답 형식", "type": "text"},
+            {"name": "auth_type", "label": "인증 방식", "type": "text"},
         ],
     },
     {
@@ -296,40 +322,44 @@ class _PublicTransport(httpx.AsyncBaseTransport):
 
 async def _json(client, method, url, *, params=None, body=None):
     async with client.stream(method, url, params=params, json=body) as response:
-        if response.status_code in (401, 403):
-            raise CollectionError(
-                "Usage access was denied. Check the credential and usage/admin permissions."
-            )
-        if response.status_code == 429:
-            raise CollectionError(
-                "The usage service rate limited this request. Try again later."
-            )
-        if 300 <= response.status_code < 400:
-            raise CollectionError("Usage service redirects are not allowed.")
-        if response.status_code != 200:
-            raise CollectionError(
-                f"The usage service returned HTTP {response.status_code}."
-            )
-        if response.headers.get("content-encoding", "identity").lower() not in (
-            "identity",
-            "",
-        ):
-            raise CollectionError("Compressed usage responses are not supported.")
-        if (
-            response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            != "application/json"
-        ):
-            raise CollectionError("The usage service did not return JSON.")
-        chunks, size = [], 0
-        async for chunk in response.aiter_bytes():
-            size += len(chunk)
-            if size > _MAX_BODY:
-                raise CollectionError("The usage response is too large.")
-            chunks.append(chunk)
-        try:
-            return _object(json.loads(b"".join(chunks)))
-        except (ValueError, RecursionError):
-            raise CollectionError(_INVALID) from None
+        return await _read_json(response)
+
+
+async def _read_json(response):
+    if response.status_code in (401, 403):
+        raise CollectionError(
+            "Usage access was denied. Check the credential and usage/admin permissions."
+        )
+    if response.status_code == 429:
+        raise CollectionError(
+            "The usage service rate limited this request. Try again later."
+        )
+    if 300 <= response.status_code < 400:
+        raise CollectionError("Usage service redirects are not allowed.")
+    if response.status_code != 200:
+        raise CollectionError(
+            f"The usage service returned HTTP {response.status_code}."
+        )
+    if response.headers.get("content-encoding", "identity").lower() not in (
+        "identity",
+        "",
+    ):
+        raise CollectionError("Compressed usage responses are not supported.")
+    if (
+        response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        != "application/json"
+    ):
+        raise CollectionError("The usage service did not return JSON.")
+    chunks, size = [], 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > _MAX_BODY:
+            raise CollectionError("The usage response is too large.")
+        chunks.append(chunk)
+    try:
+        return _object(json.loads(b"".join(chunks)))
+    except (ValueError, RecursionError):
+        raise CollectionError(_INVALID) from None
 
 
 def _days(extra):
@@ -371,6 +401,101 @@ def _openai_uncached(result):
         if all(part is not None for part in (total, read, write))
         else None
     )
+
+
+async def _anthropic(client, origin, extra):
+    # Official Admin Usage/Cost API: platform.claude.com/docs/en/api/admin-api/usage-cost
+    # Costs are decimal cents; keep API-wide billing separate from token models.
+    now = datetime.now(UTC)
+    start = (now - timedelta(days=_days(extra) - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    records = []
+    for path, costs in (
+        ("/v1/organizations/usage_report/messages", False),
+        ("/v1/organizations/cost_report", True),
+    ):
+        params = {
+            "starting_at": start.isoformat(),
+            "ending_at": now.isoformat(),
+            "bucket_width": "1d",
+            "limit": 31,
+        }
+        if not costs:
+            params["group_by[]"] = "model"
+        seen_pages, seen_buckets = set(), set()
+        for _ in range(_MAX_PAGES):
+            payload = await _json(client, "GET", origin + path, params=params)
+            for bucket in _array(payload.get("data"), 180):
+                bucket = _object(bucket)
+                stamp = _text(bucket.get("starting_at"), 64)
+                try:
+                    instant = datetime.fromisoformat(stamp)
+                    if instant.tzinfo is None or stamp in seen_buckets:
+                        raise ValueError
+                    day = instant.astimezone(UTC).date().isoformat()
+                except ValueError:
+                    raise CollectionError(_INVALID) from None
+                seen_buckets.add(stamp)
+                for result in _array(bucket.get("results")):
+                    result = _object(result)
+                    if costs:
+                        amount = result.get("amount")
+                        if (
+                            result.get("currency") != "USD"
+                            or not isinstance(amount, str)
+                            or not re.fullmatch(r"-?\d{1,18}(?:\.\d{1,12})?", amount)
+                        ):
+                            raise CollectionError(
+                                "Claude 비용은 USD 센트 문자열이어야 합니다."
+                            )
+                        records.append(
+                            _record(
+                                day,
+                                "[organization costs]",
+                                cost_usd=float(Decimal(amount) / 100),
+                            )
+                        )
+                    else:
+                        cache = _object(result.get("cache_creation", {}))
+                        writes = [
+                            _number(cache.get(key), integer=True)
+                            for key in (
+                                "ephemeral_5m_input_tokens",
+                                "ephemeral_1h_input_tokens",
+                            )
+                        ]
+                        records.append(
+                            _record(
+                                day,
+                                result.get("model") or "[unattributed model]",
+                                input_tokens=result.get("uncached_input_tokens"),
+                                output_tokens=result.get("output_tokens"),
+                                cache_read_tokens=result.get("cache_read_input_tokens"),
+                                cache_write_tokens=sum(writes)
+                                if all(x is not None for x in writes)
+                                else None,
+                            )
+                        )
+            if type(payload.get("has_more")) is not bool:
+                raise CollectionError(_INVALID)
+            if not payload["has_more"]:
+                break
+            cursor = _text(payload.get("next_page"), 2048)
+            if cursor in seen_pages:
+                raise CollectionError("The usage service repeated a pagination cursor.")
+            seen_pages.add(cursor)
+            params["page"] = cursor
+        else:
+            raise CollectionError(
+                "The usage service exceeded the pagination limit; no partial data was saved."
+            )
+    return {
+        "records": _merge(records),
+        "quota": [],
+        "capabilities": ["tokens", "cost"],
+        "note": "Claude API 조직 사용량입니다. UTC 일별·모델별 토큰이며 조직 비용은 별도 행입니다. Claude.ai 구독 대화 이력·잔여 한도와 요청 수는 제공하지 않습니다.",
+    }
 
 
 async def _openai(client, origin, extra):
@@ -550,6 +675,10 @@ async def _claude(client, origin):
     # plugins/claude-lb-usage/bin/claude-lb-usage (_limit_amount, _window_title)
     # and tests/test_integration.py (_UsageHandler.payload). No code copied.
     payload = await _json(client, "GET", origin + "/v1/usage/self")
+    return _claude_payload(payload)
+
+
+def _claude_payload(payload):
     summary = _lifetime_summary(payload)
     quota = []
     for window in _array(payload["limits"], 100):
@@ -597,6 +726,10 @@ async def _gateway(client, origin, extra):
     if extra.get("mode", "gateway") != "gateway":
         raise CollectionError("LB gateway 조회 키와 공개 HTTPS 서버 주소를 입력하세요.")
     payload = await _json(client, "GET", origin + "/v1/usage")
+    return _gateway_payload(payload)
+
+
+def _gateway_payload(payload):
     summary = _lifetime_summary(payload)
     quota, seen = [], set()
     for window in [
@@ -663,6 +796,99 @@ async def _gateway(client, origin, extra):
         "LB 키의 누적 기록이며 일별·모델별·입출력 구분은 제공되지 않습니다. 한도는 서로 겹치므로 더하지 않습니다. LB 비용 환산값은 실제 청구액이 아니므로 합계에서 제외합니다."
     )
     return result
+
+
+def _custom_address(value):
+    """Keep a public HTTPS base path; accept the usual OpenAI /v1 suffix."""
+    if (
+        not isinstance(value, str)
+        or len(value) > 500
+        or any(c.isspace() or ord(c) < 32 for c in value)
+    ):
+        raise CollectionError("공개 HTTPS API 서버 주소를 입력하세요.")
+    try:
+        parsed = urlsplit(value)
+        path = parsed.path.rstrip("/")
+        if (
+            parsed.query
+            or parsed.fragment
+            or any(c in value for c in "\\?#%")
+            or not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)*", path)
+            or any(part in (".", "..") for part in path.split("/"))
+            or parsed.port is not None
+            and not 1 <= parsed.port <= 65535
+        ):
+            raise ValueError
+        # Reuse the fixed-origin validator for scheme, host, credentials and IP.
+        host_url = httpx.URL(value).copy_with(path="", port=None)
+        _origin(str(host_url))
+        origin = str(httpx.URL(value).copy_with(path="")).rstrip("/")
+        return origin, path.removesuffix("/v1")
+    except (ValueError, httpx.InvalidURL):
+        raise CollectionError(
+            "경로·호스트·포트를 확인하고 HTTPS 주소를 입력하세요."
+        ) from None
+
+
+async def _custom(client, origin, prefix, credential, extra):
+    path = extra.get("usage_path", "/v1/usage")
+    format = extra.get("format", "auto")
+    auth = extra.get("auth_type", "auto")
+    if (
+        not isinstance(path, str)
+        or len(path) > 300
+        or not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)+", path)
+        or any(part in (".", "..") for part in path.split("/"))
+        or format not in ("auto", "claude-lb", "gateway", "usage-json")
+        or auth not in ("auto", "bearer", "x-api-key")
+    ):
+        raise CollectionError("사용량 경로·응답 형식·인증 방식을 확인하세요.")
+    paths = [path]
+    if format == "auto" and path == "/v1/usage":
+        paths.extend(("/v1/usage/self", "/usage.json"))
+    for index, candidate in enumerate(paths):
+        headers = {}
+        method = (
+            "x-api-key"
+            if auth == "auto" and candidate.endswith("/usage/self")
+            else auth
+        )
+        if credential:
+            if method == "x-api-key":
+                headers = {"x-api-key": credential, "anthropic-version": "2023-06-01"}
+            else:
+                headers = {"Authorization": "Bearer " + credential}
+        # Only known GET analytics paths are probed, never /messages/responses.
+        async with client.stream(
+            "GET", origin + prefix + candidate, headers=headers
+        ) as response:
+            if response.status_code in (401, 403, 404, 405) and index < len(paths) - 1:
+                continue
+            if response.status_code in (404, 405):
+                raise CollectionError(
+                    "사용량 API를 찾을 수 없습니다. 서버의 사용량 경로와 조회 키를 확인하세요."
+                )
+            payload = await _read_json(response)
+        detected = format
+        if detected == "auto":
+            if "records" in payload:
+                detected = "usage-json"
+            elif "request_count" in payload and "limits" in payload:
+                detected = (
+                    "claude-lb" if candidate.endswith("/usage/self") else "gateway"
+                )
+            else:
+                raise CollectionError(
+                    "서버가 지원되는 사용량 JSON을 반환하지 않았습니다. 추론 API 인증과 사용량 조회 권한은 별개입니다."
+                )
+        return {
+            "usage-json": _usage_json,
+            "claude-lb": _claude_payload,
+            "gateway": _gateway_payload,
+        }[detected](payload)
+    raise CollectionError(
+        "사용량 API를 찾을 수 없습니다. 서버의 사용량 경로와 조회 키를 확인하세요."
+    )
 
 
 def _usage_json(payload):
@@ -768,12 +994,15 @@ async def _collect(account):
     metadata = next((item for item in PROVIDERS if item["id"] == provider), None)
     if metadata is None:
         raise CollectionError("This usage provider is not supported.")
-    if provider == "chatgpt":
+    if provider in ("chatgpt", "gemini-account"):
         raise CollectionError(
-            "ChatGPT 로그인으로 계정을 연결하세요. API 키는 필요하지 않습니다."
+            f"{metadata['name']} 로그인으로 계정을 연결하세요. API 키는 필요하지 않습니다."
         )
-    origin = _origin(account.get("base_url") or metadata["default_url"])
-    if provider in ("openai", "grok") and origin != metadata["default_url"]:
+    if provider == "custom-api":
+        origin, prefix = _custom_address(account.get("base_url"))
+    else:
+        origin, prefix = _origin(account.get("base_url") or metadata["default_url"]), ""
+    if provider in ("openai", "grok", "claude") and origin != metadata["default_url"]:
         raise CollectionError(
             "This provider uses a fixed official API origin; custom origins are not supported."
         )
@@ -788,17 +1017,17 @@ async def _collect(account):
         or any(ord(c) < 33 or ord(c) > 126 for c in credential)
     ):
         raise CollectionError("The credential is invalid; enter only the bearer token.")
-    if not credential and provider != "usage-json":
+    if not credential and provider not in ("usage-json", "custom-api"):
         if provider == "claude-lb":
             raise CollectionError(
                 "A Claude LB API key is required. Add the sk-clb key from your administrator."
             )
         raise CollectionError("A usage/admin credential is required for this provider.")
     headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
-    if provider == "claude-lb":
+    if provider in ("claude-lb", "claude"):
         headers["x-api-key"] = credential
         headers["anthropic-version"] = "2023-06-01"
-    elif credential:
+    elif credential and provider != "custom-api":
         headers["Authorization"] = "Bearer " + credential
     async with httpx.AsyncClient(
         transport=_PublicTransport(),
@@ -808,6 +1037,10 @@ async def _collect(account):
         timeout=httpx.Timeout(_TIMEOUT),
         limits=httpx.Limits(max_connections=2),
     ) as client:
+        if provider == "custom-api":
+            return await _custom(client, origin, prefix, credential, extra)
+        if provider == "claude":
+            return await _anthropic(client, origin, extra)
         if provider == "openai":
             return await _openai(client, origin, extra)
         if provider == "grok":
