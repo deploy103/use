@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#18181b" />
+    <title>Use · AI 사용량 콘솔</title>
+    <link rel="stylesheet" href="/static/style.css?v=use-1" />
+    <script src="/static/app.js?v=use-1" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">본문으로 이동</a>
+    <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 6a8 8 0 0 1 14 6M4 12a8 8 0 0 0 14 6" /></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5" /></symbol>
+        <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6" /></symbol>
+        <symbol id="i-edit" viewBox="0 0 24 24"><path d="m15 4 5 5M4 20l5-1L21 7l-5-5L4 14v6Z" /></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" /></symbol>
+        <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6m0-6L10 14M10 4H4v16h16v-6" /></symbol>
+      </defs>
+    </svg>
+
+    <div id="boot" class="boot" role="status"><span class="wordmark">Use<span></span></span><p>관리자 세션을 확인하는 중…</p></div>
+
+    <main id="login-view" class="login-page" hidden>
+      <header class="login-header"><a class="wordmark" href="/" aria-label="Use 홈">Use<span></span></a><span>개인 AI 사용량 콘솔</span></header>
+      <section class="login-box" aria-labelledby="login-title">
+        <div class="login-symbol" aria-hidden="true">U</div>
+        <h1 id="login-title">Use 관리자 로그인</h1>
+        <p id="login-description" class="muted">이 서버의 관리자 비밀번호를 입력하세요.</p>
+        <form id="login-form">
+          <label for="password">관리자 비밀번호</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="200" />
+          <div id="setup-fields" hidden>
+            <label for="password-confirm">비밀번호 확인</label>
+            <input id="password-confirm" type="password" autocomplete="new-password" maxlength="200" />
+            <div id="setup-token-wrap"><label for="setup-token">서버 최초 설정 토큰</label><input id="setup-token" type="password" autocomplete="off" /></div>
+            <p class="field-help">서버 관리자가 제공한 최초 설정 토큰과 12자 이상의 새 비밀번호가 필요합니다.</p>
+          </div>
+          <p id="login-error" class="notice error" role="alert" hidden></p>
+          <button id="login-submit" class="button primary full" type="submit">관리자 로그인</button>
+        </form>
+        <p class="login-note">ChatGPT·Claude 등 제공업체의 로그인이 아닙니다.<br />서비스 계정 연결은 관리자 로그인 후 진행합니다.</p>
+      </section>
+      <footer class="login-footer">인증 정보는 이 서버에 암호화하여 보관합니다. 추론 요청은 보내지 않습니다.</footer>
+    </main>
+
+    <div id="app-view" hidden>
+      <header class="topbar">
+        <div class="topbar-inner"><a class="wordmark" href="/" aria-label="Use 홈">Use<span></span></a><span class="workspace-name"><span class="slash">/</span> 개인 워크스페이스</span><div class="owner-controls"><span class="private-label">비공개</span><span class="owner-label">관리자</span><button id="logout" class="text-button">로그아웃</button></div></div>
+      </header>
+      <div class="navigation-shell">
+        <nav id="service-nav" class="service-nav content-width" aria-label="서비스 선택">
+          <button data-service="chatgpt" aria-pressed="false"><span class="provider-mark chatgpt" aria-hidden="true">◎</span>ChatGPT</button>
+          <button data-service="claude" aria-pressed="false"><span class="provider-mark claude-lb" aria-hidden="true">✳</span>Claude</button>
+          <button data-service="gemini" aria-pressed="false"><span class="provider-mark gemini" aria-hidden="true">✦</span>Gemini</button>
+          <button data-service="grok" aria-pressed="false"><span class="provider-mark grok" aria-hidden="true">𝕏</span>Grok</button>
+          <button data-service="all" class="selected" aria-pressed="true">전체<span id="service-count" class="count">0</span></button>
+        </nav>
+      </div>
+      <main id="main-content" class="content-width" tabindex="-1">
+        <div class="viewbar"><nav aria-label="주 메뉴"><button data-view="overview" class="active" aria-current="page">개요</button><button data-view="connections">연결 관리 <span id="nav-account-count" class="count">0</span></button></nav><div class="sync-controls"><label><input id="auto-refresh" type="checkbox" checked /> 60초 자동 조회</label><button id="refresh" class="button small"><svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg><span>사용량 수집</span></button></div></div>
+        <div class="page-heading"><div><h1 id="page-title">사용량 개요</h1><p id="page-description">기간별 사용량과 계정별 한도를 구분해서 확인하세요.</p></div><button id="add-account" class="button primary"><svg class="icon" aria-hidden="true"><use href="#i-plus" /></svg>계정 연결</button></div>
+        <div id="global-error" class="notice error" role="alert" hidden></div>
+        <div id="loading-status" class="loading-status" role="status" hidden>사용량을 조회하는 중…</div>
+        <div id="data-notice" class="notice" hidden></div>
+        <div id="overview-section">
+          <section class="filterbar" aria-label="기간별 사용량 필터">
+            <div class="segmented" role="group" aria-label="조회 기간"><button data-range="today" aria-pressed="false">오늘</button><button data-range="7d" class="selected" aria-pressed="true">7일</button><button data-range="30d" aria-pressed="false">30일</button><button data-range="all" aria-pressed="false">전체 기간</button></div>
+            <div class="filter-controls"><label class="sr-only" for="provider-filter">연결 종류</label><select id="provider-filter"><option value="all">모든 연결 종류</option></select><label class="sr-only" for="account-filter">계정 선택</label><select id="account-filter"><option value="all">모든 계정</option></select><button id="export" class="button small"><svg class="icon" aria-hidden="true"><use href="#i-download" /></svg>CSV</button></div>
+          </section>
+          <div class="section-caption"><span id="date-caption">선택한 기간 · Asia/Seoul</span><span>기간별 집계 · 한도 및 전체 누적 제외</span></div>
+          <section id="metrics" class="metrics" aria-label="선택 기간의 사용량"></section>
+          <div class="overview-grid">
+            <section class="panel chart-panel" aria-labelledby="daily-title"><div class="panel-heading"><h2 id="daily-title">일별 사용량</h2><div class="segmented compact" role="group" aria-label="차트 지표"><button data-metric="total_tokens" class="selected" aria-pressed="true">토큰</button><button data-metric="requests" aria-pressed="false">요청</button><button data-metric="cost_usd" aria-pressed="false">비용</button></div></div><div id="daily-chart" class="daily-chart"></div><p id="chart-detail" class="chart-detail">기록이 있는 날짜만 표시합니다.</p></section>
+            <section class="panel connection-panel" aria-labelledby="connection-title"><div class="panel-heading"><h2 id="connection-title">연결 현황</h2><button class="text-button" data-view="connections">관리</button></div><div id="connection-summary"></div><p class="panel-footnote">제공되는 지표는 연결 종류마다 다릅니다.<br />확인할 수 없는 값은 0 대신 — 로 표시합니다.</p></section>
+          </div>
+          <section class="panel" aria-labelledby="model-title"><div class="panel-heading"><h2 id="model-title">모델별 사용량 <span id="model-count" class="count">0</span></h2><span class="muted small-text">선택 기간 · 일반 입력은 캐시 제외</span></div><div class="table-scroll" role="region" aria-label="모델별 사용량 표, 가로 스크롤 가능" tabindex="0"><table class="model-table"><thead><tr><th scope="col">모델 / 계정</th><th scope="col">요청</th><th scope="col">일반 입력</th><th scope="col">출력</th><th scope="col">캐시 읽기</th><th scope="col">캐시 쓰기</th><th scope="col">총 토큰</th><th scope="col">비용 (USD)</th></tr></thead><tbody id="model-rows"></tbody></table></div><div id="model-empty" class="empty" hidden></div></section>
+        </div>
+        <section id="accounts-section" aria-labelledby="accounts-title"><div class="section-heading"><div><h2 id="accounts-title">계정별 한도와 누적 <span id="account-count" class="count">0</span></h2><p>아래 값은 선택 기간과 무관하며 기간별 통계에 합산하지 않습니다.</p></div><span class="muted small-text">여러 계정을 개별 관리</span></div><div id="accounts-list" class="accounts-list"></div></section>
+        <footer class="page-footer"><span>Use <span class="footer-separator">/</span> 사용량 조회 전용</span><span id="last-updated">성공한 수집 기록 없음</span></footer>
+      </main>
+    </div>
+
+    <dialog id="provider-dialog" aria-labelledby="provider-title"><div class="dialog-heading"><h2 id="provider-title">서비스 연결</h2><button class="icon-button" data-close="provider-dialog" aria-label="서비스 선택 닫기"><svg class="icon" aria-hidden="true"><use href="#i-close" /></svg></button></div><p class="dialog-description">연결 방식을 선택하세요. 같은 서비스도 여러 계정을 추가할 수 있습니다.</p><div id="provider-picker" class="provider-picker"></div></dialog>
+
+    <dialog id="chatgpt-dialog" aria-labelledby="chatgpt-title"><div class="dialog-heading"><h2 id="chatgpt-title">ChatGPT 계정 연결</h2><button class="icon-button" data-close="chatgpt-dialog" aria-label="ChatGPT 연결 닫기"><svg class="icon" aria-hidden="true"><use href="#i-close" /></svg></button></div><p class="dialog-description">OpenAI 인증 페이지에서 로그인합니다. Use에 ChatGPT 비밀번호를 입력하지 마세요. Use는 OpenAI가 제공하거나 보증하는 앱이 아닙니다.</p>
+      <form id="chatgpt-form"><label for="chatgpt-name">계정 이름</label><input id="chatgpt-name" maxlength="100" placeholder="예: 개인 ChatGPT / 업무 ChatGPT" autocomplete="off" /><button id="start-chatgpt-login" class="button primary full" type="submit">브라우저 연결 시작</button></form>
+      <div id="chatgpt-authorization" hidden><div class="oauth-step"><span class="step-number">1</span><div><h3>OpenAI에서 로그인</h3><p>아래 버튼을 눌러 새 탭에서 인증을 진행하세요.</p><a id="authorization-link" class="button" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">OpenAI 인증 페이지 열기<svg class="icon" aria-hidden="true"><use href="#i-external" /></svg></a></div></div><div class="oauth-step"><span class="step-number">2</span><div><h3>리디렉션 주소 붙여넣기</h3><p>원격 서버를 사용하면 로그인 후 <strong>localhost 연결 오류</strong>가 나타날 수 있습니다. 예상된 동작입니다. 주소 표시줄의 <strong>전체 URL</strong>을 복사해 아래에 붙여넣으세요.</p></div></div><form id="callback-form"><label for="callback-url">전체 콜백 URL</label><textarea id="callback-url" rows="3" required autocomplete="off" spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=…&amp;state=…"></textarea><p class="field-help">code와 state가 포함된 주소 전체가 필요합니다. 다른 사람에게 공유하지 마세요.</p><button id="complete-chatgpt-login" class="button primary full" type="submit">연결 완료</button></form><p id="chatgpt-expiry" class="field-help"></p></div>
+      <p id="chatgpt-status" class="field-help" role="status" aria-live="polite"></p><p id="chatgpt-error" class="notice error" role="alert" hidden></p><p class="scope-note">Codex 사용량·한도와 제공되는 활동만 조회합니다. ChatGPT 웹 전체 대화의 토큰 이력이 아닙니다.</p><div class="dialog-actions"><button class="button" data-close="chatgpt-dialog">취소 / 닫기</button><button id="retry-chatgpt-login" class="button primary" hidden>다시 시작</button></div>
+    </dialog>
+
+    <dialog id="account-dialog" aria-labelledby="account-title"><form id="account-form"><div class="dialog-heading"><h2 id="account-title">계정 연결</h2><button class="icon-button" type="button" data-close="account-dialog" aria-label="계정 설정 닫기"><svg class="icon" aria-hidden="true"><use href="#i-close" /></svg></button></div><p id="account-description" class="dialog-description"></p><label for="account-name">계정 이름</label><input id="account-name" name="name" required maxlength="100" placeholder="예: 업무용 게이트웨이" /><div id="connection-fields"><label for="account-provider">연결 종류</label><select id="account-provider" disabled></select><label for="account-url">서버 주소 (HTTPS)</label><input id="account-url" name="base_url" type="url" maxlength="500" placeholder="https://…" /><label id="credential-label" for="account-credential">인증 키</label><input id="account-credential" name="credential" type="password" autocomplete="new-password" spellcheck="false" maxlength="16000" /><p id="credential-help" class="field-help">인증 정보는 서버에 암호화 저장되며 다시 표시되지 않습니다.</p><div id="provider-extra-fields"></div><details id="advanced-options"><summary>추가 설정 JSON</summary><label class="sr-only" for="account-extra">추가 설정 JSON 객체</label><textarea id="account-extra" rows="3" placeholder="{}" spellcheck="false"></textarea><p class="field-help">입력하면 기존 추가 설정 전체를 대체합니다. 기존 값을 유지하려면 추가 설정 필드를 모두 비워두세요.</p></details></div><label id="account-enabled-wrap" class="checkbox-label" hidden><input id="account-enabled" type="checkbox" checked /> 사용량 수집 활성화</label><p id="account-error" class="notice error" role="alert" hidden></p><div class="dialog-actions"><button class="button" type="button" data-close="account-dialog">취소</button><button id="save-account" class="button primary" type="submit">계정 연결</button></div></form></dialog>
+
+    <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title"><h2 id="delete-title">이 계정의 연결을 삭제할까요?</h2><p id="delete-description" class="dialog-description"></p><p class="scope-note">이 서버의 계정별 사용량 기록도 삭제되며 복구할 수 없습니다. 제공업체의 계정이나 API 키 자체는 삭제하지 않습니다.</p><p id="delete-error" class="notice error" role="alert" hidden></p><div class="dialog-actions"><button class="button" data-close="delete-dialog" autofocus>취소</button><button id="confirm-delete" class="button danger">연결 삭제</button></div></dialog>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

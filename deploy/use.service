@@ -1,0 +1,28 @@
+[Unit]
+Description=Use AI usage dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=use
+Group=use
+WorkingDirectory=/opt/use
+Environment=ATLAS_DATA_DIR=/var/lib/use
+Environment=ATLAS_PUBLIC_ORIGIN=https://use.example.com
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/use/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --no-proxy-headers
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/use
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=1500M
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
